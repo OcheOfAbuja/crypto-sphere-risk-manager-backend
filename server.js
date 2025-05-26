@@ -8,10 +8,13 @@ const crypto = require('crypto');
 const nodemailer = require('nodemailer'); 
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
-require('dotenv').config(); // Load environment variables
+require('dotenv').config();
 
 const app = express();
 const DEPLOYED_FRONTEND_URL = process.env.DEPLOYED_FRONTEND_URL || 'http://localhost:5173';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // CORS configuration to allow requests from your frontend
 app.use(cors({
@@ -22,11 +25,12 @@ app.use(cors({
   methods: 'GET,HEAD,PUT,POST,DELETE,PATCH',
   credentials: true,
 }));
+app.use(express.json());
 
-app.use(express.json()); // Middleware to parse JSON request bodies
-
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const JWT_SECRET = process.env.JWT_SECRET;
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+  next();
+});
 
 const client = new OAuth2Client(GOOGLE_CLIENT_ID); // Initialize Google OAuth client
 
@@ -107,18 +111,36 @@ function generateAuthToken(user) {
   ); 
 }
 
-// Middleware to verify JWT token
+// Middleware function
 const verifyToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+    // 1. Get the token from the header
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Expected format: "Bearer TOKEN"
 
-  if (token == null) return res.sendStatus(401); // No token, unauthorized
+    if (!token) {
+        console.warn('verifyToken: No token provided in Authorization header.');
+        return res.status(401).json({ message: 'Access Denied: No token provided' });
+    }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403); // Token invalid or expired, forbidden
-    req.user = user; // Attach user payload to request
-    next(); // Proceed to the next middleware/route handler
-  });
+    // 2. Verify the token
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            console.error('verifyToken: Token verification failed:', err.message);
+            // Specific errors for debugging:
+            if (err.name === 'TokenExpiredError') {
+                return res.status(403).json({ message: 'Access Denied: Token expired' });
+            }
+            if (err.name === 'JsonWebTokenError') {
+                return res.status(403).json({ message: 'Access Denied: Invalid token' });
+            }
+            // Generic error
+            return res.status(403).json({ message: 'Access Denied: Failed to authenticate token' });
+        }
+        // 3. If valid, attach user payload to request
+        req.user = user; // The 'user' here is the decoded payload from the token
+        console.log('verifyToken: Token successfully verified for user:', user.email || user.username);
+        next(); // Proceed to the next middleware/route handler
+    });
 };
 
 // --- Nodemailer Transporter Setup ---
@@ -266,24 +288,59 @@ app.post('/api/login', async (req, res) => {
 
 // Google Login/Sign-up
 app.post('/api/google-login', async (req, res) => {
-  const { token: googleAccesToken } = req.body; // This 'token' is the Google ID token from the frontend
-  if (!googleAccesToken) {
-    return res.status(400).json({ message: 'Google Access token not provided' });
-  }
-  try {
-    // Verify the Google ID token
-    console.log('Attempting to fetch Google UserInfo with Access Token...');
-    const userInfoResponse = await axios.get(
-            `https://www.googleapis.com/oauth2/v3/userinfo?access_token=${googleAccessToken}`
-        );
-        const payload = userInfoResponse.data;
-        console.log('Google UserInfo Payload:', payload);
+  const { token: googleCredential } = req.body; // This 'token' is the Google ID token from the frontend
+  
+  console.log('Backend /api/google-login received request.');
+  console.log('Received token (first 30 chars):', googleCredential ? googleCredential.substring(0, 30) + '...' : 'No token received in body');
+
+  if (!googleCredential) {
+    console.error('Backend: Google credential not provided in request body.');
+    return res.status(400).json({ message: 'Google credential not provided' });
+  }try {
+    let payload = null;
+    let verificationMethod = 'unknown';
+    try {
+        console.log('Backend: Attempting to verify Google credential as ID Token...');
+        console.log('Backend: Using GOOGLE_CLIENT_ID for audience:', GOOGLE_CLIENT_ID); // LOG THE CLIENT ID
+          const ticket = await client.verifyIdToken({
+          idToken: googleCredential,
+          audience: GOOGLE_CLIENT_ID, // Ensure the audience matches your Client ID
+        });
+        payload = ticket.getPayload();
+        verificationMethod = 'ID Token';
+        console.log('Backend: ID Token verification successful. Payload email:', payload);
+    } catch (idTokenError) {
+        console.warn('Backend: ID Token verification failed. Error details:', idTokenError.message);
+        console.warn('Backend: Possible reasons for ID Token failure: Incorrect GOOGLE_CLIENT_ID, expired token, or token is an Access Token.');
+        // If ID token verification fails, try to use it as an Access Token
+        // This is your original logic, kept as a fallback for robustness.
+        console.log('Backend: Falling back to Access Token validation...');
+        try {
+            const userInfoResponse = await axios.get(
+              `https://www.googleapis.com/oauth2/v3/userinfo?access_token=${googleCredential}`
+            );
+            payload = userInfoResponse.data;
+            verificationMethod = 'Access Token';
+            console.log('Backend: Access Token validation successful. Payload email:', payload?.email);
+          } catch (accessTokenError) {
+            console.error('Backend: Access Token validation also failed. Details:', accessTokenError.response?.data || accessTokenError.message);
+            console.error('Backend: Complete Access Token error object:', accessTokenError);
+            throw new Error('Invalid Google credential provided.');
+          }
+      }
+
+      if (!payload) {
+        // This case should ideally not be hit with the current logic, but good for safety.
+        console.error('Backend: Payload is null after both ID Token and Access Token verification attempts.');
+        throw new Error('Failed to retrieve user information from Google credential.');
+      }
 
     const googleName = payload?.name;
     const googleEmail = payload?.email;
     const googleId = payload?.sub; // 'sub' is the unique Google ID
 
     if (!googleName || !googleEmail || !googleId) {
+      console.error('Backend: Could not retrieve complete user information from Google payload.');
       return res.status(400).json({ message: 'Could not retrieve user information from Google' });
     }
 
@@ -306,7 +363,7 @@ app.post('/api/google-login', async (req, res) => {
           });
           userRecord.googleId = googleId; // Update the in-memory record for the current response
         }
-        console.log(`Google user ${googleEmail} found.`);
+        console.log(`Google user ${googleEmail} found and logged in.`);
         const authToken = generateAuthToken(userRecord);
         return res.json({ token: authToken, user: userRecord });
       } else {
@@ -341,7 +398,7 @@ app.post('/api/google-login', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Google Access token verification failed:', error);
+    console.error('Backend: Google login/signup processing failed:', error);
     return res.status(401).json({ message: 'Google login failed', error: error.message });
   }
 });
