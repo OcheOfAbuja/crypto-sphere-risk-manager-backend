@@ -308,7 +308,7 @@ app.post('/api/google-login', async (req, res) => {
         });
         payload = ticket.getPayload();
         verificationMethod = 'ID Token';
-        console.log('Backend: ID Token verification successful. Payload email:', payload);
+        console.log('Backend: ID Token verification successful. Payload email:', payload?.email);
     } catch (idTokenError) {
         console.warn('Backend: ID Token verification failed. Error details:', idTokenError.message);
         console.warn('Backend: Possible reasons for ID Token failure: Incorrect GOOGLE_CLIENT_ID, expired token, or token is an Access Token.');
